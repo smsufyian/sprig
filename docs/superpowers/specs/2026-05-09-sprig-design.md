@@ -471,3 +471,5 @@ sprig/
 - **LLM-enhanced synthetic data:** An optional pass using an LLM to produce more realistic domain-specific values (product names, realistic addresses). Synthetic engine is designed to accept this as a post-processing step.
 - **Space sharing:** Exposing a space's services over the network to teammates (e.g. ngrok-style tunnels). Out of scope for V1.
 - **Windows / WSL2:** Adding a `WSL2Driver` implementing the `PlatformDriver` interface is the extension point.
+- **btrfs hard requirement (Linux):** If the user's Linux host cannot provide btrfs, V1 will fail with a clear message and setup guide. A plain-copy fallback (slower DB cloning) is a potential V2 addition.
+- **Multi-engine DB pull:** V1 implements production pull via pg_dump (PostgreSQL). MySQL and MongoDB pull modes require their own dump/restore drivers behind the same `DBPuller` interface — planned for V2.
