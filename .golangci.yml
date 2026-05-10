@@ -6,9 +6,6 @@ linters:
     - unused
     - misspell
 
-linters-settings:
-  govet:
-    shadow: true
 
 issues:
   exclude-rules:
