@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   test:
     name: Test
@@ -14,7 +17,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: .mise.toml
+          go-version-file: go.mod
           cache: true
 
       - name: Vet
@@ -34,7 +37,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: .mise.toml
+          go-version-file: go.mod
           cache: true
 
       - uses: golangci/golangci-lint-action@v6
