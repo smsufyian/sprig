@@ -17,6 +17,7 @@ sprig is a Go CLI tool that creates fully isolated virtual spaces for developers
 - Runs on macOS and Linux
 - Complexity is fully abstracted: the user never touches Nix expressions, container configs, or filesystem primitives
 - Extensible: new runtimes and services are self-contained additions
+- No runtime reflection anywhere in the codebase — all encoding/decoding is explicit or code-generated
 
 ## Non-Goals
 
@@ -129,10 +130,21 @@ New platforms (e.g. WSL2) are added by implementing this interface.
 
 ## CLI Reference
 
+### Global flags (all commands)
+```bash
+--output text|json    # default: text. json emits machine-readable JSON for AI agents + scripts
+--timeout <duration>  # max time for the command (e.g. 120s, 5m). default: 60s
+--debug               # enable verbose logging to ~/.sprig/sprig.log
+```
+
 ### Setup
 ```bash
 sprig init                                   # bootstrap: Lima VM (macOS) or btrfs check (Linux)
 sprig doctor                                 # diagnose platform issues
+sprig version                                # print version, commit, build date
+sprig update                                 # self-update to latest release (verifies SHA256)
+sprig update --version 1.2.0                 # pin to a specific version
+sprig completion bash|zsh|fish               # print shell completion script
 ```
 
 ### Space Lifecycle
@@ -140,11 +152,15 @@ sprig doctor                                 # diagnose platform issues
 sprig create <name>                          # auto-detect stack, create space
 sprig create <name> --from production        # create with prod DB clone
 sprig create <name> --from staging           # create from named seed
+sprig create <name> --timeout 120s           # override default timeout
 sprig list                                   # list all spaces across all projects
 sprig status <name>                          # status of a single space
 sprig start <name>
 sprig stop <name>
 sprig destroy <name>
+sprig prune                                  # interactive cleanup of stopped/stale spaces
+sprig prune --days 7                         # auto-remove spaces stopped for >7 days
+sprig prune --dry-run                        # show what would be removed without acting
 ```
 
 ### Working in a Space
@@ -171,6 +187,13 @@ sprig db restore <name> --from <label>       # restore named snapshot
 ### Configuration
 ```bash
 sprig config edit                            # open sprig.toml in $EDITOR (pre-filled with detected values as comments)
+```
+
+### Telemetry
+```bash
+sprig telemetry status                       # show whether telemetry is on/off + anonymous ID
+sprig telemetry disable                      # opt out (writes to ~/.sprig/telemetry.json)
+sprig telemetry enable                       # re-enable
 ```
 
 ### CI Mode
@@ -340,6 +363,42 @@ Per-space directory at `~/.sprig/spaces/<name>/`:
 
 `space.nix` is generated from merged detected+override config. Re-generated and applied whenever `sprig.toml` changes. Port allocation is deterministic via a host-wide registry at `~/.sprig/ports.json` — no two spaces ever share a port.
 
+### File Locking
+
+Every read-modify-write cycle on `registry.json` and `ports.json` acquires an exclusive `syscall.Flock` file lock before reading and releases it after writing. This prevents corruption when multiple sprig processes run simultaneously (common in CI where several jobs may call `sprig create` in parallel).
+
+```
+internal/lock/lock.go   ← WithLock(path string, fn func() error) error
+```
+
+Lock files are adjacent to the data files (`.registry.lock`, `.ports.lock`). A process that cannot acquire the lock within 5 seconds fails with a clear error: `"another sprig process is running — retry in a moment"`.
+
+### Signal Handling + Context Threading
+
+All engine operations accept a `context.Context`. The CLI root initialises a cancellable context tied to `SIGINT` / `SIGTERM`:
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+```
+
+When the user presses Ctrl+C during a long `sprig create`:
+1. The context is cancelled
+2. The engine rolls back: destroys the partially created container, releases allocated ports, removes the registry entry
+3. Exits cleanly with a message: `"interrupted — space cleaned up"`
+
+Every engine method signature: `func (e *Engine) Create(ctx context.Context, ...) (*Space, error)`
+
+### Input Validation
+
+Space names are validated before any operation:
+- Allowed characters: `[a-z0-9-]`
+- Maximum length: 40 characters
+- Must start with a letter
+- Reserved names rejected: `base`, `default`, `snapshots`
+
+Violation produces a clear error: `error: space name "My Feature" must match [a-z][a-z0-9-]{0,39}`
+
 ### Space Registry
 
 `~/.sprig/registry.json` — tracks all spaces across all projects:
@@ -424,6 +483,81 @@ sprig destroy agent-task-123
 
 ---
 
+## Logging
+
+Structured logging via `log/slog` (stdlib, Go 1.21+). No external dependency.
+
+- Written to `~/.sprig/sprig.log` — never to stdout/stderr (never pollutes command output)
+- `DEBUG` level: off by default; enabled via `SPRIG_DEBUG=1` or `--debug` flag
+- `INFO` level: key lifecycle events (space created, container started, migration applied)
+- `WARN` level: recoverable issues (port reassigned, migration had warnings)
+- `ERROR` level: failures with full context
+
+Sensitive data (connection strings, project paths, space names) is never written to the log. Users can inspect the log with `sprig logs` (tails `~/.sprig/sprig.log`).
+
+---
+
+## Telemetry
+
+**Library:** `github.com/posthog/posthog-go`
+
+Privacy rules (non-negotiable):
+- Opt-out by default — disclosed on first `sprig init` with disable instructions
+- `SPRIG_NO_TELEMETRY=1` or `sprig telemetry disable` turns it off permanently
+- Anonymous device ID generated once, stored in `~/.sprig/telemetry.json` — never tied to identity
+- **Never collected:** space names, project paths, connection strings, file contents, any user data
+
+| Event | Properties collected |
+|---|---|
+| `command_run` | command, subcommand, duration_ms, success, error_type (enum), os, arch, version |
+| `space_created` | services (list of names), runtime, seeded (bool), duration_ms |
+| `db_operation` | operation, db_engine, duration_ms, success |
+| `error` | command, error_type (enum — never the message), os, version |
+
+All events are fired asynchronously in a goroutine and flushed on process exit — zero latency impact on commands.
+
+---
+
+## No-Reflection Policy
+
+No `reflect` package usage anywhere in sprig — not directly, not via library. Rationale: reflection bypasses compile-time type safety, produces opaque runtime errors, and makes code harder to trace.
+
+| Concern | Approach |
+|---|---|
+| JSON marshaling | `github.com/mailru/easyjson` — code-generated at `go generate` time |
+| TOML parsing (sprig.toml) | Hand-rolled recursive descent parser (~200 lines) |
+| YAML parsing (docker-compose.yml) | `gopkg.in/yaml.v3` Node API — explicit tree traversal, no struct mapping |
+| Synthetic data generation | Explicit `switch` on SQL column types — no Go struct introspection |
+| Test assertions | stdlib `testing` only — no testify, no go-cmp |
+
+---
+
+## Dependencies
+
+```
+# Runtime
+github.com/spf13/cobra              v1.8.1   CLI framework
+github.com/mailru/easyjson          v0.7     Reflection-free JSON (code-generated)
+gopkg.in/yaml.v3                    v3       YAML Node API (docker-compose hints)
+github.com/jackc/pgx/v5             v5       PostgreSQL driver (schema introspection + pull)
+github.com/zalando/go-keyring       v0.2     OS keychain for production DB credentials
+github.com/posthog/posthog-go       v1       Usage telemetry
+
+# Hand-rolled (no library)
+sprig.toml parser                            ~200 lines, replaces TOML library
+SQL schema data generator                    Explicit type-switch, replaces gofakeit
+
+# Test (no reflection)
+stdlib testing only
+
+# Dev tooling (not in go.mod)
+golangci-lint   v1.57    Linting
+goreleaser      v2       Cross-platform releases + Homebrew tap
+easyjson        v0.7     go generate tool for JSON code generation
+```
+
+---
+
 ## Testing Strategy
 
 | Layer | Approach |
@@ -446,21 +580,71 @@ sprig/
       main.go
   internal/
     cli/               ← cobra command definitions
+      db/              ← sprig db subcommand group
     detect/            ← stack auto-detection (one file per ecosystem)
-    engine/            ← space lifecycle: create, start, stop, destroy
+    engine/            ← space lifecycle: create, start, stop, destroy (context-threaded)
     nix/               ← NixOS expression generator
     platform/          ← PlatformDriver interface + Linux/macOS implementations
     db/
       pull/            ← production snapshot
       seed/            ← manual seed
-      synth/           ← synthetic data generation
+      synth/           ← synthetic data generation (explicit SQL type switch)
       snapshot/        ← btrfs subvolume management
-    registry/          ← space registry (state.json, ports.json)
-    config/            ← sprig.toml parsing and merging
+    registry/          ← space registry (registry.json, ports.json)
+    config/            ← hand-rolled sprig.toml parser and merger
+    lock/              ← syscall.Flock file locking for registry + ports
+    log/               ← slog initialisation and helpers
+    telemetry/         ← PostHog client wrapper (async, opt-out)
+    validate/          ← space name validation
+    version/           ← version, commit, build date (set via ldflags)
+  .github/
+    workflows/
+      ci.yml           ← test + lint on every PR
+      release.yml      ← goreleaser on git tag v*
+      nightly.yml      ← full integration suite on cron
+  .goreleaser.yml      ← cross-platform builds + Homebrew tap
+  .golangci.yml        ← linter config
+  Makefile             ← build, test, lint, generate targets
   docs/
     superpowers/
       specs/
         2026-05-09-sprig-design.md
+      plans/
+        2026-05-09-plan1-foundation.md
+```
+
+---
+
+## CI/CD + Release Pipeline
+
+### GitHub Actions workflows
+
+| Workflow | Trigger | Steps |
+|---|---|---|
+| `ci.yml` | Every PR + push to master | `go vet`, `golangci-lint`, `go test -race -coverprofile`, build for linux-amd64 + darwin-arm64 |
+| `release.yml` | `git tag v*` | `goreleaser release` → binaries, checksums, GitHub Release, Homebrew tap update |
+| `nightly.yml` | Cron 02:00 UTC | Full integration suite (including Lima VM on macOS runner) |
+
+### GoReleaser
+
+Produces on every tagged release:
+- `sprig_<version>_linux_amd64.tar.gz`
+- `sprig_<version>_linux_arm64.tar.gz`
+- `sprig_<version>_darwin_amd64.tar.gz`
+- `sprig_<version>_darwin_arm64.tar.gz`
+- `checksums.txt` (SHA256)
+- GitHub Release with auto-generated changelog (filters `docs:`, `test:`, `ci:` commits)
+- Homebrew formula updated in `github.com/smsufyian/homebrew-tap`
+
+### Makefile targets
+
+```makefile
+build:     go build -ldflags "$(LDFLAGS)" -o dist/sprig ./cmd/sprig
+test:      go test -race -coverprofile=coverage.out ./...
+lint:      golangci-lint run
+generate:  go generate ./...          # runs easyjson code generation
+clean:     rm -rf dist/ coverage.out
+install:   go install -ldflags "$(LDFLAGS)" ./cmd/sprig
 ```
 
 ---
