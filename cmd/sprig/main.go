@@ -1,19 +1,22 @@
 package main
 
 import (
-	"context"
+	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/smsufyian/sprig/internal/cli"
+	"github.com/spf13/cobra"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	root := &cobra.Command{
+		Use:     "sprig",
+		Short:   "Isolated virtual spaces for development, testing, and CI",
+		Long:    `sprig creates fully isolated environments for developers, AI agents, and CI pipelines.`,
+		Version: "0.1.0",
+	}
 
-	if err := cli.NewRootCmd(ctx).Execute(); err != nil {
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
